@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License. You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -59,6 +60,10 @@ public class MirrorSourceTask extends SourceTask {
     private boolean stopping = false;
     private Semaphore consumerAccess;
     private OffsetSyncWriter offsetSyncWriter;
+
+    // ENHANCEMENT: Keep track of the exact next offset we expect to read per partition.
+    // This allows O(1) gap detection without making blocking network calls to the broker on every loop.
+    private final Map<TopicPartition, Long> expectedOffsets = new HashMap<>();
 
     public MirrorSourceTask() {}
 
@@ -97,13 +102,8 @@ public class MirrorSourceTask extends SourceTask {
 
     @Override
     public void commit() {
-        // Handle delayed and pending offset syncs only when offsetSyncWriter is available
         if (offsetSyncWriter != null) {
-            // Offset syncs which were not emitted immediately due to their offset spacing should be sent periodically
-            // This ensures that low-volume topics aren't left with persistent lag at the end of the topic
             offsetSyncWriter.promoteDelayedOffsetSyncs();
-            // Publish any offset syncs that we've queued up, but have not yet been able to publish
-            // (likely because we previously reached our limit for number of outstanding syncs)
             offsetSyncWriter.firePendingOffsetSyncs();
         }
     }
@@ -116,14 +116,14 @@ public class MirrorSourceTask extends SourceTask {
         try {
             consumerAccess.acquire();
         } catch (InterruptedException e) {
-            log.warn("Interrupted waiting for access to consumer. Will try closing anyway."); 
+            log.warn("Interrupted waiting for access to consumer. Will try closing anyway.");
         }
         Utils.closeQuietly(consumer, "source consumer");
         Utils.closeQuietly(offsetSyncWriter, "offset sync writer");
         Utils.closeQuietly(legacyMetrics, "metrics");
         log.info("Stopping {} took {} ms.", Thread.currentThread().getName(), System.currentTimeMillis() - start);
     }
-   
+
     @Override
     public String version() {
         return new MirrorSourceConnector().version();
@@ -139,6 +139,58 @@ public class MirrorSourceTask extends SourceTask {
         }
         try {
             ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
+
+            // -----------------------------------------------------------------
+            // ENHANCEMENT: Accurate, Lazy-Evaluated Fault Detection
+            // We analyze the actual records returned to find offset anomalies.
+            // -----------------------------------------------------------------
+            for (TopicPartition tp : records.partitions()) {
+                List<ConsumerRecord<byte[], byte[]>> partitionRecords = records.records(tp);
+                if (partitionRecords.isEmpty()) continue;
+
+                long firstFetchedOffset = partitionRecords.get(0).offset();
+                Long expected = expectedOffsets.get(tp);
+
+                if (expected != null) {
+                    if (firstFetchedOffset > expected) {
+                        // GAP DETECTED: Is it a Truncation (retention policy) or just Compaction?
+                        // We ONLY make the network call to the broker during an anomaly.
+                        long logStartOffset = consumer.beginningOffsets(java.util.Collections.singleton(tp)).getOrDefault(tp, 0L);
+
+                        if (expected < logStartOffset) {
+                            // SCENARIO 2: Log Truncation
+                            long lostMessages = logStartOffset - expected;
+                            String errorMsg = String.format(
+                                "[MirrorSourceTask] LOG TRUNCATION DETECTED on partition %s. " +
+                                "Expected offset %d, but broker's logStartOffset is %d. " +
+                                "Approximately %d messages were permanently deleted by retention before replication. " +
+                                "Failing fast to prevent silent data loss in DR cluster.",
+                                tp, expected, logStartOffset, lostMessages
+                            );
+                            log.error(errorMsg);
+                            throw new DataLossException(errorMsg);
+                        } else {
+                            // The data wasn't deleted by retention; it's a natural gap (Compaction or Txn Markers).
+                            log.debug("Natural offset gap on {} from {} to {} due to compaction. Continuing.", tp, expected, firstFetchedOffset);
+                        }
+                    } else if (firstFetchedOffset < expected) {
+                        // SCENARIO 3: Topic Reset
+                        // If the offset dropped backwards, the topic was deleted and recreated.
+                        log.warn(
+                            "[MirrorSourceTask] TOPIC RESET DETECTED on partition {}. " +
+                            "Expected offset was {}, but fetched offset is {}. " +
+                            "Topic was recreated. Resuming replication from new beginning automatically.",
+                            tp, expected, firstFetchedOffset
+                        );
+                    }
+                }
+
+                // Update expected offset for the NEXT poll cycle based on the highest record just read
+                long lastFetchedOffset = partitionRecords.get(partitionRecords.size() - 1).offset();
+                expectedOffsets.put(tp, lastFetchedOffset + 1L);
+            }
+            // -----------------------------------------------------------------
+
             List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
             for (ConsumerRecord<byte[], byte[]> record : records) {
                 SourceRecord converted = convertRecord(record);
@@ -156,7 +208,6 @@ public class MirrorSourceTask extends SourceTask {
                 }
             }
             if (sourceRecords.isEmpty()) {
-                // WorkerSourceTasks expects non-zero batch size
                 return null;
             } else {
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
@@ -169,20 +220,19 @@ public class MirrorSourceTask extends SourceTask {
             return null;
         } catch (Throwable e)  {
             log.error("Failure during poll.", e);
-            // allow Connect to deal with the exception
             throw e;
         } finally {
             consumerAccess.release();
         }
     }
- 
+
     @Override
     public void commitRecord(SourceRecord record, RecordMetadata metadata) {
         if (stopping) {
             return;
         }
         if (metadata == null) {
-            log.debug("No RecordMetadata (source record was probably filtered out during transformation) -- can't sync offsets for {}.", record.topic());
+            log.debug("No RecordMetadata -- can't sync offsets for {}.", record.topic());
             return;
         }
         if (!metadata.hasOffset()) {
@@ -199,17 +249,15 @@ public class MirrorSourceTask extends SourceTask {
             metrics.countRecord(topicPartition);
             metrics.replicationLatency(topicPartition, latency);
         }
-        // Queue offset syncs only when offsetWriter is available
         if (offsetSyncWriter != null) {
             TopicPartition sourceTopicPartition = MirrorUtils.unwrapPartition(record.sourcePartition());
             long upstreamOffset = MirrorUtils.unwrapOffset(record.sourceOffset());
             long downstreamOffset = metadata.offset();
             offsetSyncWriter.maybeQueueOffsetSyncs(sourceTopicPartition, upstreamOffset, downstreamOffset);
-            // We may be able to immediately publish an offset sync that we've queued up here
             offsetSyncWriter.firePendingOffsetSyncs();
         }
     }
- 
+
     private Map<TopicPartition, Long> loadOffsets(Set<TopicPartition> topicPartitions) {
         return topicPartitions.stream().collect(Collectors.toMap(x -> x, this::loadOffset));
     }
@@ -228,7 +276,6 @@ public class MirrorSourceTask extends SourceTask {
                 .filter(this::isUncommitted).count());
 
         topicPartitionOffsets.forEach((topicPartition, offset) -> {
-            // Do not call seek on partitions that don't have an existing offset committed.
             if (isUncommitted(offset)) {
                 log.trace("Skipping seeking offset for topicPartition: {}", topicPartition);
                 return;
@@ -236,10 +283,13 @@ public class MirrorSourceTask extends SourceTask {
             long nextOffsetToCommittedOffset = offset + 1L;
             log.trace("Seeking to offset {} for topicPartition: {}", nextOffsetToCommittedOffset, topicPartition);
             consumer.seek(topicPartition, nextOffsetToCommittedOffset);
+
+            // ENHANCEMENT: Populate our expected offset tracker using the loaded committed offsets
+            expectedOffsets.put(topicPartition, nextOffsetToCommittedOffset);
         });
     }
 
-    // visible for testing 
+    // visible for testing
     SourceRecord convertRecord(ConsumerRecord<byte[], byte[]> record) {
         String targetTopic = formatRemoteTopic(record.topic());
         Headers headers = convertHeaders(record);
